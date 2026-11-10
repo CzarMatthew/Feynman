@@ -9,6 +9,9 @@ function getClient() {
 
 export type JsonSchema = Record<string, unknown>;
 
+const MIN_TOKENS = 16000;
+const RETRY_TOKENS = 20000;
+
 // Structured outputs accept a subset of JSON Schema: every object needs
 // additionalProperties: false, and length/number limits aren't allowed.
 const DROP_KEYS = new Set([
@@ -71,21 +74,27 @@ export async function callStructured<T>(opts: {
   temperature?: number; // ignored; not supported by current models
 }): Promise<T> {
   const model = process.env.ANTHROPIC_MODEL || DEFAULT_MODEL;
-  const params = {
-    model,
-    max_tokens: opts.maxTokens ?? 4000,
-    system: `${opts.system}\n\nYour reply is JSON for "${opts.toolName}": ${opts.toolDescription}`,
-    messages: [{ role: "user", content: opts.user }],
-    output_config: {
-      format: { type: "json_schema", schema: toStrictSchema(opts.schema) },
-    },
-  } as unknown as Anthropic.MessageCreateParamsNonStreaming;
+  // Generous budgets: you only pay for tokens actually used, and current
+  // models may think before answering, which counts against max_tokens.
+  // Stay under ~21k, the SDK's limit for non-streaming requests.
+  const budgets = [Math.max(opts.maxTokens ?? 0, MIN_TOKENS), RETRY_TOKENS];
 
   let lastErr: unknown;
-  for (let attempt = 0; attempt < 2; attempt++) {
+  for (let attempt = 0; attempt < budgets.length; attempt++) {
+    const params = {
+      model,
+      max_tokens: budgets[attempt],
+      system: `${opts.system}\n\nYour reply is JSON for "${opts.toolName}": ${opts.toolDescription}`,
+      messages: [{ role: "user", content: opts.user }],
+      output_config: {
+        format: { type: "json_schema", schema: toStrictSchema(opts.schema) },
+      },
+    } as unknown as Anthropic.MessageCreateParamsNonStreaming;
     try {
       const res = await getClient().messages.create(params);
-      if (res.stop_reason === "max_tokens") throw new Error("Reply was cut off (max_tokens too low).");
+      if (res.stop_reason === "max_tokens") {
+        throw new Error(`Reply was cut off at ${budgets[attempt]} tokens.`);
+      }
       if (res.stop_reason === "refusal") throw new Error("The model declined this request.");
       const text = res.content
         .filter((b): b is Anthropic.TextBlock => b.type === "text")
